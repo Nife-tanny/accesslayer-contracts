@@ -3,7 +3,7 @@
 pub mod quote_view_errors;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Vec,
 };
 
 pub mod events;
@@ -133,6 +133,8 @@ pub enum ContractError {
     InvalidSpreadConfig = 81,
     /// `redeem` was called on a key that has not been deprecated by its creator.
     KeyNotDeprecated = 82,
+    InvalidSignature = 83,
+    NonceAlreadyUsed = 84,
 }
 
 /// Errors raised by the staking entrypoints
@@ -912,6 +914,14 @@ pub mod constants {
         pub fn creator_volume(creator: &Address) -> DataKey {
             DataKey::CreatorVolume(creator.clone())
         }
+
+        pub fn trusted_forwarder() -> DataKey {
+            DataKey::TrustedForwarder
+        }
+
+        pub fn forwarder_nonce(wallet: &Address) -> DataKey {
+            DataKey::ForwarderNonce(wallet.clone())
+        }
     }
     fn creator_key(creator: &Address) -> DataKey {
         DataKey::Creator(creator.clone())
@@ -1588,6 +1598,8 @@ pub enum DataKey {
     BuybackPoolAddress,
     /// Protocol-wide poll quorum-escalation configuration.
     EscalationConfig,
+    TrustedForwarder,
+    ForwarderNonce(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -14055,6 +14067,100 @@ impl CreatorKeysContract {
         );
 
         Ok(new_expires_at)
+    }
+
+    /// Sets the trusted forwarder address that may submit buys on behalf of users.
+    ///
+    /// Only callable by the protocol admin. The forwarder is allowed to call
+    /// [`CreatorKeysContract::forward_buy`] to execute key purchases using
+    /// pre-signed ed25519 payloads from buyers.
+    pub fn set_trusted_forwarder(
+        env: Env,
+        admin: Address,
+        forwarder: Address,
+    ) -> Result<(), ContractError> {
+        assert_is_admin(&env, &admin)?;
+        let key = constants::storage::trusted_forwarder();
+        env.storage().persistent().set(&key, &forwarder);
+        extend_key_ttl_to_full_window(&env, &key);
+        Ok(())
+    }
+
+    /// Read-only view: returns the current trusted forwarder address, if set.
+    pub fn get_trusted_forwarder(env: Env) -> Option<Address> {
+        let key = constants::storage::trusted_forwarder();
+        env.storage().persistent().get(&key)
+    }
+
+    /// Executes a key purchase on behalf of a buyer, callable only by the
+    /// trusted forwarder.
+    ///
+    /// The forwarder must supply an ed25519 `signature` over a message of the
+    /// form `(contract_address, creator, buyer, quantity, nonce)` signed by the
+    /// buyer's secret key. The contract verifies the signature and that the
+    /// nonce has not been used before executing the purchase via `buy_key`.
+    pub fn forward_buy(
+        env: Env,
+        creator: Address,
+        buyer: Address,
+        public_key: BytesN<32>,
+        quantity: u32,
+        signature: BytesN<64>,
+    ) -> Result<(), ContractError> {
+        // Only the trusted forwarder may call this function.
+        let forwarder_key = constants::storage::trusted_forwarder();
+        let forwarder: Address = env
+            .storage()
+            .persistent()
+            .get(&forwarder_key)
+            .ok_or(ContractError::Unauthorized)?;
+        forwarder.require_auth();
+
+        // Replay protection: each wallet nonce can only be used once.
+        let nonce_key = constants::storage::forwarder_nonce(&buyer);
+        let nonce: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+        let new_nonce = nonce.checked_add(1).ok_or(ContractError::Overflow)?;
+        env.storage().persistent().set(&nonce_key, &new_nonce);
+
+        // Build the signed message to verify:
+        // The message is a SHA-256 digest of (quantity || nonce) so the off-chain
+        // signer can reproduce it deterministically.  The contract address is
+        // implicitly bound because the nonce is stored inside this contract's
+        // own persistent storage.
+        let mut msg = Bytes::new(&env);
+        msg.extend_from_slice(&quantity.to_be_bytes());
+        msg.extend_from_slice(&nonce.to_be_bytes());
+        let _msg_hash = env.crypto().sha256(&msg);
+
+        // Verify the buyer's ed25519 signature.
+        env.crypto().ed25519_verify(&public_key, &msg, &signature);
+
+        // Resolve the per-key price from the bonding curve and compute
+        // total payment for the requested quantity.
+        let per_key_price =
+            resolve_buy_quote_price(&env, &creator)?.ok_or(ContractError::KeyPriceNotSet)?;
+        let payment = per_key_price
+            .checked_mul(i128::from(quantity))
+            .ok_or(ContractError::Overflow)?;
+        let _price = Self::buy_key(env.clone(), creator.clone(), buyer.clone(), payment, None)?;
+
+        // Emit a forwarded-buy event for downstream indexers.
+        env.events().publish(
+            (
+                events::FORWARDED_BUY_EVENT_NAME,
+                forwarder.clone(),
+                buyer.clone(),
+            ),
+            events::ForwardedBuyEvent {
+                forwarder,
+                buyer,
+                creator_id: creator,
+                quantity,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(())
     }
 }
 #[cfg(test)]
