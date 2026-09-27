@@ -95,7 +95,9 @@ impl TreasuryContract {
     }
 
     pub fn get_distribution_history(env: Env, epoch: u32) -> Option<EpochDistribution> {
-        env.storage().persistent().get(&DataKey::EpochHistory(epoch))
+        env.storage()
+            .persistent()
+            .get(&DataKey::EpochHistory(epoch))
     }
 }
 
