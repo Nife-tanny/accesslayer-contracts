@@ -6,7 +6,7 @@ use soroban_sdk::{testutils::Address as _, vec, Address, Env, String};
 #[test]
 fn test_treasury() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, TreasuryContract);
+    let contract_id = env.register(TreasuryContract, ());
     let client = TreasuryContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
@@ -44,7 +44,7 @@ fn test_treasury() {
 #[should_panic(expected = "Insufficient balance")]
 fn test_distribute_insufficient_balance() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, TreasuryContract);
+    let contract_id = env.register(TreasuryContract, ());
     let client = TreasuryContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
